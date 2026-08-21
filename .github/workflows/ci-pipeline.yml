@@ -390,16 +390,12 @@ jobs:
         if: ${{ inputs.e2e_script != '' }}
         run: |
           set -e
-          # Imagen E2E base oficial de Puppeteer + el script del repo.
+          # e2e_script apunta al Dockerfile E2E del repo (context = su directorio),
+          # que a su vez hace COPY del script JS (ej. e2e_preview.js). Ejemplo:
+          #   e2e_script: backend/scripts/e2e.Dockerfile  → context: backend/scripts
+          E2E_DIR="$(dirname ${{ inputs.e2e_script }})"
           docker build -f ${{ inputs.e2e_script }} \
-            -t ${E2E_IMG} ${{ inputs.context }}/scripts/ 2>/dev/null \
-            || docker build -t ${E2E_IMG} -f - . <<'DOCKEREOF'
-          FROM ghcr.io/puppeteer/puppeteer:latest
-          WORKDIR /e2e
-          RUN npm init -y >/dev/null 2>&1 && npm install puppeteer --no-fund --no-audit
-          COPY . .
-          CMD ["node", "e2e_preview.js"]
-          DOCKEREOF
+            -t ${E2E_IMG} "${E2E_DIR}"
           docker run --rm \
             --network ${PREVIEW_NET} \
             -e PREVIEW_URL="http://${PREVIEW_CONT}:${{ inputs.preview_internal_port }}" \
