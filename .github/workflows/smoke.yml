@@ -1,4 +1,4 @@
-name: Smoke7 (reusable)
+name: Smoke8 (reusable)
 on:
   workflow_call:
     inputs:
@@ -15,14 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Scan deps
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@0.36.0
         with:
-          scan-type: fs
-          scan-ref: .
-          severity: CRITICAL
+          scan-type: "fs"
+          scan-ref: "."
+          severity: "CRITICAL"
           exit-code: "1"
-          ignore-unfixed: true
-          vuln-type: library
+          ignore-unfixed: "true"
   job2:
     runs-on: ubuntu-latest
     needs: trivy-fs
