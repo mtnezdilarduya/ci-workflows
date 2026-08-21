@@ -115,20 +115,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout (git CLI con gh auth)
+      - name: Checkout (workspace del job)
         run: |
-          # El runner tiene gh preinstalado y autenticado con el token del job.
-          # gh auth setup-git configura git para usar el token — así el clone
-          # del repo del caller (público o privado) funciona sin credenciales.
-          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
-          git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
-            "https://github.com/${GITHUB_REPOSITORY}.git" repo
-          cd repo
-          git checkout "${GITHUB_SHA}" 2>/dev/null || true
-          echo "checked out ${GITHUB_REPOSITORY} @ ${GITHUB_SHA::7}"
+          # GitHub prepara el workspace del job con el código del repo CALLER.
+          ls -la . | head -5
+          echo "workspace listo"
 
       - name: Install Trivy CLI
         run: |
@@ -138,7 +130,7 @@ jobs:
           trivy --version
 
       - name: Scan dependencies (fs)
-        working-directory: repo
+        working-directory: .
         run: |
           mkdir -p /tmp/trivy-cache-${{ github.run_id }}
           trivy fs \
@@ -153,7 +145,7 @@ jobs:
 
       - name: Generar SARIF trivy-fs (siempre)
         if: always()
-        working-directory: repo
+        working-directory: .
         run: |
           trivy fs \
             --severity ${{ inputs.trivy_severity }} \
@@ -176,19 +168,14 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout (git CLI con gh auth)
+      - name: Checkout (workspace del job)
         run: |
-          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
-          git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
-            "https://github.com/${GITHUB_REPOSITORY}.git" repo
-          cd repo
-          git checkout "${GITHUB_SHA}" 2>/dev/null || true
+          ls -la . | head -5
+          echo "workspace del preview listo"
 
       - name: Semgrep scan (CLI + SARIF)
-        working-directory: repo
+        working-directory: .
         run: |
           pip install semgrep
           semgrep scan --config p/security-audit --config p/python --config p/javascript \
@@ -198,7 +185,7 @@ jobs:
 
       - name: Guardar SARIF semgrep
         if: always()
-        working-directory: repo
+        working-directory: .
         run: |
           mkdir -p /tmp/artifacts
           cp semgrep.sarif /tmp/artifacts/ 2>/dev/null || true
@@ -216,15 +203,11 @@ jobs:
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout (git CLI con gh auth)
+      - name: Checkout (workspace del job)
         run: |
-          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
-          git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
-            "https://github.com/${GITHUB_REPOSITORY}.git" repo
-          cd repo
-          git checkout "${GITHUB_SHA}" 2>/dev/null || true
+          ls -la . | head -5
+          echo "workspace del preview listo"
 
       - name: Docker meta (tags)
         id: meta
@@ -237,7 +220,7 @@ jobs:
           echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
 
       - name: Build image
-        working-directory: repo
+        working-directory: .
         run: |
           docker build \
             -f ${{ inputs.dockerfile }} \
@@ -315,16 +298,11 @@ jobs:
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout (git CLI con gh auth)
+      - name: Checkout (workspace del job)
         run: |
-          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
-          git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
-            "https://github.com/${GITHUB_REPOSITORY}.git" repo
-          cd repo
-          git checkout "${GITHUB_SHA}" 2>/dev/null || true
+          ls -la . | head -5
+          echo "workspace del preview listo"
 
       - name: Parametrizar recursos del preview (H4)
         id: res
@@ -376,9 +354,9 @@ jobs:
           set -e
           URL="http://127.0.0.1:${PREVIEW_PORT}"
           curl -sf -o /dev/null -w "GET / -> %{http_code}\n" "$URL/"
-          if [ -n "${{ inputs.healthcheck_script }}" ] && [ -f "repo/${{ inputs.healthcheck_script }}" ]; then
+          if [ -n "${{ inputs.healthcheck_script }}" ] && [ -f "${{ inputs.healthcheck_script }}" ]; then
             echo "Healthcheck específico del repo..."
-            bash "repo/${{ inputs.healthcheck_script }}" "$URL"
+            bash "${{ inputs.healthcheck_script }}" "$URL"
           fi
           echo "HEALTHCHECK OK"
 
@@ -388,7 +366,7 @@ jobs:
           set -e
           docker run --rm \
             --network ${PREVIEW_NET} \
-            -v ${GITHUB_WORKSPACE}/repo/backend/scripts:/scripts \
+            -v ${GITHUB_WORKSPACE}/backend/scripts:/scripts \
             -e PREVIEW_URL="http://${PREVIEW_CONT}:${{ inputs.preview_internal_port }}" \
             grafana/k6 run --summary-export /scripts/k6-summary.json \
             /scripts/load_test.js || echo "k6 con fallos (no gate en esta fase)"
@@ -407,8 +385,8 @@ jobs:
         if: ${{ inputs.e2e_script != '' }}
         run: |
           set -e
-          E2E_DIR="repo/$(dirname ${{ inputs.e2e_script }})"
-          docker build -f "repo/${{ inputs.e2e_script }}" \
+          E2E_DIR="$(dirname ${{ inputs.e2e_script }})"
+          docker build -f "${{ inputs.e2e_script }}" \
             -t ${E2E_IMG} "${E2E_DIR}"
           docker run --rm \
             --network ${PREVIEW_NET} \
@@ -424,7 +402,7 @@ jobs:
           mkdir -p ${GITHUB_WORKSPACE}/zap-out
           ZAP_EXIT=0
           docker run --rm -t \
-            -v ${GITHUB_WORKSPACE}/repo/.zap/rules.tsv:/zap/rules.tsv \
+            -v ${GITHUB_WORKSPACE}/.zap/rules.tsv:/zap/rules.tsv \
             -v ${GITHUB_WORKSPACE}/zap-out:/zap/wrk \
             ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
             -t "${ZAP_TARGET}" \
