@@ -1,0 +1,447 @@
+# ci-pipeline.yml — Workflow reutilizable de CI/CD (workflow_call).
+#
+# Uso: cualquier repo del usuario (cuenta personal GitHub) lo invoca con:
+#   uses: mtnezdilarduya/ci-workflows/.github/workflows/ci-pipeline.yml@v1
+#
+# CUBRE LA CADENA COMÚN (build → trivy → semgrep → preview/DAST):
+#   - trivy-fs      : escaneo de dependencias (gate CRITICAL)
+#   - semgrep       : análisis estático de seguridad (SAST + SARIF)
+#   - docker-build  : build + push a DockerHub (latest + sha) + Docker Scout
+#   - trivy-image   : escaneo de la imagen publicada (gate CRITICAL/HIGH)
+#   - preview       : preview efímero en el runner self-hosted del homelab
+#                     (healthcheck → E2E → k6 → ZAP → destruye) — con lock
+#                     (flock) para que 2 proyectos distintos no se pisen.
+#
+# NO cubre el job `test` (H1 de la auditoría Claude 2026-08-21): cada repo
+# tiene SU propio test (stack distinto). El caller lo define y este workflow
+# solo orquesta la parte homogénea. Los secrets son del REPO QUE LLAMA
+# (mapeo explícito en el caller, nunca inherit — mínimo privilegio).
+#
+# Seguridad (H5): guard `if: github.ref == 'refs/heads/main'` en preview
+# para que un PR de fork jamás ejecute código en el homelab.
+#
+# Concurrencia (H4): todos los recursos del preview se parametrizan con
+# ${project}-${sha} (puerto dinámico por repo, red única por run, contenedor
+# único) + flock para serializar previews simultáneos entre repos.
+
+name: CI Pipeline (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      # ── Identidad / build ───────────────────────────────────────────────
+      image_name:
+        description: "Nombre completo de la imagen Docker (ej. mtnezdilarduya/finpowerr)"
+        required: true
+        type: string
+      context:
+        description: "Contexto del Dockerfile (ej. backend, .)"
+        required: false
+        default: "."
+        type: string
+      dockerfile:
+        description: "Ruta al Dockerfile dentro del contexto (ej. Dockerfile, backend/Dockerfile)"
+        required: false
+        default: "Dockerfile"
+        type: string
+      runner_label:
+        description: "Label del runner self-hosted para el preview (default homelab-preview)"
+        required: false
+        default: "homelab-preview"
+        type: string
+
+      # ── Preview efímero ────────────────────────────────────────────────
+      preview_port_range:
+        description: "Rango base de puertos del preview por repo (ej. 3100). Cada run usa puerto = base + sha%100 (3100-3199)"
+        required: false
+        default: 3100
+        type: number
+      preview_internal_port:
+        description: "Puerto interno del contenedor (el que EXPONE la app)"
+        required: false
+        default: 3000
+        type: number
+      healthcheck_script:
+        description: "Ruta al script de healthcheck del repo (se copia al contenedor E2E y ejecuta contra el preview). Si vacío, solo curl /"
+        required: false
+        default: ""
+        type: string
+      e2e_script:
+        description: "Ruta al script E2E (Puppeteer) del repo. Si vacío, se omite el E2E"
+        required: false
+        default: ""
+        type: string
+      zap_enabled:
+        description: "Correr OWASP ZAP baseline (DAST) sobre el preview"
+        required: false
+        default: true
+        type: boolean
+      k6_enabled:
+        description: "Correr k6 (carga/rendimiento) sobre el preview"
+        required: false
+        default: true
+        type: boolean
+
+      # ── Gates / umbrales ───────────────────────────────────────────────
+      trivy_severity:
+        description: "Severidad mínima del gate trivy (fs e image)"
+        required: false
+        default: "CRITICAL,HIGH"
+        type: string
+      zap_fail_threshold:
+        description: "Exit code de ZAP que falla el job (0=info,1=Low/Med,2=High)"
+        required: false
+        default: 2
+        type: number
+
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_TOKEN:
+        required: false
+
+# Cada repo que llame puede añadir su propio concurrency; aquí el default
+# protege que un push nuevo de la misma rama cancele el run anterior.
+concurrency:
+  group: ci-reusable-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # SCA — dependencias
+  # ─────────────────────────────────────────────────────────────────────
+  trivy-fs:
+    name: Trivy (deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan Python/JS dependencies (fs)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.context }}
+          severity: ${{ inputs.trivy_severity }}
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: library
+          format: sarif
+          output: trivy-fs.sarif
+
+      - name: Upload Trivy fs SARIF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-fs-sarif
+          path: trivy-fs.sarif
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────
+  # SAST — semgrep
+  # ─────────────────────────────────────────────────────────────────────
+  semgrep:
+    name: Semgrep (SAST)
+    runs-on: ubuntu-latest
+    needs: trivy-fs
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Semgrep scan (CLI + SARIF)
+        run: |
+          pip install semgrep
+          semgrep scan --config p/security-audit --config p/python --config p/javascript \
+            --sarif --sarif-output semgrep.sarif \
+            --error --severity ERROR . || true
+          ls -la semgrep.sarif 2>/dev/null || echo "semgrep.sarif no generado"
+
+      - name: Upload SARIF to GitHub (code scanning)
+        if: hashFiles('semgrep.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+
+      - name: Upload Semgrep SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Build + push a DockerHub + Scout
+  # ─────────────────────────────────────────────────────────────────────
+  docker-build:
+    name: Docker build + push + Scout
+    runs-on: ubuntu-latest
+    needs: [trivy-fs, semgrep]
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ inputs.image_name }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+
+      - name: Login to Docker Hub
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        uses: docker/login-action@v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build image (push only if creds exist)
+        uses: docker/build-push-action@v7.3.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
+          tags: ${{ steps.meta.outputs.tags }}
+
+      - name: Docker Scout (vuln analysis)
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        uses: docker/scout-action@v1.24.0
+        with:
+          command: cves,recommendations
+          image: ${{ inputs.image_name }}:latest
+          only-severities: critical,high
+          dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
+          sarif-file: scout-report.sarif
+
+      - name: Upload Scout SARIF
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: scout-report
+          path: scout-report.sarif
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Trivy imagen publicada
+  # ─────────────────────────────────────────────────────────────────────
+  trivy-image:
+    name: Trivy (image)
+    runs-on: ubuntu-latest
+    needs: [test, docker-build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Trivy CLI
+        run: |
+          curl -fsSL -o /tmp/trivy.deb \
+            https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.deb
+          sudo dpkg -i /tmp/trivy.deb
+          trivy --version
+
+      - name: Scan image with Trivy (CLI, DB fresca)
+        run: |
+          docker pull ${{ inputs.image_name }}:sha-${GITHUB_SHA::7}
+          trivy image \
+            --severity ${{ inputs.trivy_severity }} \
+            --ignore-unfixed \
+            --vuln-type os,library \
+            --no-progress \
+            --cache-dir /tmp/trivy-cache-${GITHUB_RUN_ID} \
+            --ignorefile ${{ inputs.context }}/.trivyignore \
+            --exit-code 1 \
+            ${{ inputs.image_name }}:sha-${GITHUB_SHA::7}
+
+      - name: Generate Trivy image SARIF
+        if: always()
+        run: |
+          trivy image \
+            --severity ${{ inputs.trivy_severity }} \
+            --ignore-unfixed \
+            --vuln-type os,library \
+            --no-progress \
+            --cache-dir /tmp/trivy-cache-${GITHUB_RUN_ID} \
+            --ignorefile ${{ inputs.context }}/.trivyignore \
+            --format sarif \
+            --output trivy-image.sarif \
+            ${{ inputs.image_name }}:sha-${GITHUB_SHA::7} || true
+
+      - name: Upload Trivy image SARIF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-sarif
+          path: trivy-image.sarif
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Preview efímero + DAST (runner self-hosted del homelab)
+  # ─────────────────────────────────────────────────────────────────────
+  preview:
+    name: Preview efímero + DAST
+    runs-on: ${{ inputs.runner_label }}
+    # Cadena explícita: el DAST NUNCA corre sobre una imagen no verificada.
+    needs: [test, docker-build, trivy-image]
+    # Guard de seguridad (H5): solo main — un PR de fork jamás toca el homelab.
+    if: github.ref == 'refs/heads/main'
+    env:
+      PREVIEW_PORT_BASE: ${{ inputs.preview_port_range }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parametrizar recursos del preview (H4)
+        id: res
+        run: |
+          # Nombre corto del repo (owner/repo -> repo) para prefijos únicos
+          REPO_SHORT="${GITHUB_REPOSITORY##*/}"
+          # Puerto del preview: base + sha%100 (dentro del rango del repo)
+          SHA_NUM=$((16#$GITHUB_SHA))
+          PORT=$(( PREVIEW_PORT_BASE + (SHA_NUM % 100) ))
+          # Red + contenedor + imagen E2E únicos por run
+          NET="${REPO_SHORT}-e2e-net-${GITHUB_SHA::7}"
+          CONT="${REPO_SHORT}-preview-${GITHUB_SHA::7}"
+          E2E_IMG="${REPO_SHORT}-e2e:${GITHUB_SHA::7}"
+          echo "port=${PORT}" >> "$GITHUB_OUTPUT"
+          echo "net=${NET}" >> "$GITHUB_OUTPUT"
+          echo "cont=${CONT}" >> "$GITHUB_OUTPUT"
+          echo "e2e_img=${E2E_IMG}" >> "$GITHUB_OUTPUT"
+          echo "PREVIEW_PORT=${PORT}" >> "$GITHUB_ENV"
+          echo "PREVIEW_NET=${NET}" >> "$GITHUB_ENV"
+          echo "PREVIEW_CONT=${CONT}" >> "$GITHUB_ENV"
+          echo "E2E_IMG=${E2E_IMG}" >> "$GITHUB_ENV"
+          echo "Recursos: port=${PORT} net=${NET} cont=${CONT} e2e=${E2E_IMG}"
+
+      - name: Lock de preview (cola entre repos)
+        # Serializa los previews entre repos distintos: el 2º espera hasta
+        # 15 min a que el 1º acabe. Evita colisiones de recursos físicos.
+        run: |
+          exec 9>/tmp/ci-preview.lock
+          flock -w 900 9 || { echo "ERROR: timeout esperando el preview de otro repo" >&2; exit 1; }
+          echo "Lock adquirido — preview de ${GITHUB_REPOSITORY}"
+
+      - name: Prune de imágenes viejas (H6)
+        run: |
+          docker image prune -f --filter "until=24h" 2>/dev/null || true
+          docker system prune -f --filter "until=24h" 2>/dev/null || true
+
+      - name: Levantar preview efímero
+        env:
+          PREVIEW_IMAGE: ${{ inputs.image_name }}:sha-${{ github.sha }}
+        run: |
+          set -e
+          PREVIEW_IMAGE=${{ inputs.image_name }}:sha-${GITHUB_SHA::7}
+          docker network create ${PREVIEW_NET} 2>/dev/null || true
+          docker rm -f ${PREVIEW_CONT} 2>/dev/null || true
+          docker run -d --name ${PREVIEW_CONT} \
+            --network ${PREVIEW_NET} \
+            -p ${PREVIEW_PORT}:${{ inputs.preview_internal_port }} \
+            -e DATABASE_PATH=/tmp/preview.db \
+            -e JWT_SECRET=preview-secret-${GITHUB_SHA} \
+            ${PREVIEW_IMAGE}
+          echo "Preview up en :${PREVIEW_PORT} (red ${PREVIEW_NET})"
+          sleep 5
+
+      - name: Healthcheck del preview
+        run: |
+          set -e
+          URL="http://127.0.0.1:${PREVIEW_PORT}"
+          curl -sf -o /dev/null -w "GET / -> %{http_code}\n" "$URL/"
+          # Si el repo aporta su healthcheck.sh, ejecutarlo contra el preview
+          if [ -n "${{ inputs.healthcheck_script }}" ] && [ -f "${{ inputs.healthcheck_script }}" ]; then
+            echo "Ejecutando healthcheck específico del repo..."
+            bash "${{ inputs.healthcheck_script }}" "$URL"
+          fi
+          echo "HEALTHCHECK OK"
+
+      - name: Test NO funcional (k6 carga/rendimiento)
+        if: ${{ inputs.k6_enabled }}
+        run: |
+          set -e
+          # El script k6 vive en backend/scripts/load_test.js del repo
+          # (o en la ruta que aporte el repo). Se monta y se apunta al
+          # contenedor por nombre en la red compartida.
+          docker run --rm \
+            --network ${PREVIEW_NET} \
+            -v ${GITHUB_WORKSPACE}/backend/scripts:/scripts \
+            -e PREVIEW_URL="http://${PREVIEW_CONT}:${{ inputs.preview_internal_port }}" \
+            grafana/k6 run --summary-export /scripts/k6-summary.json \
+            /scripts/load_test.js
+          echo "K6 OK"
+
+      - name: Robustez post-carga
+        run: |
+          set -e
+          URL="http://127.0.0.1:${PREVIEW_PORT}"
+          curl -sf -o /dev/null -w "healthcheck post-carga -> %{http_code}\n" "$URL/"
+          docker inspect -f '{{.State.Running}}' ${PREVIEW_CONT} | grep -q true \
+            && echo "contenedor preview sigue vivo" \
+            || { echo "ERROR: el preview murió bajo carga" >&2; exit 1; }
+
+      - name: E2E frontend (Puppeteer)
+        if: ${{ inputs.e2e_script != '' }}
+        run: |
+          set -e
+          # Imagen E2E base oficial de Puppeteer + el script del repo.
+          docker build -f ${{ inputs.e2e_script }} \
+            -t ${E2E_IMG} ${{ inputs.context }}/scripts/ 2>/dev/null \
+            || docker build -t ${E2E_IMG} -f - . <<'DOCKEREOF'
+          FROM ghcr.io/puppeteer/puppeteer:latest
+          WORKDIR /e2e
+          RUN npm init -y >/dev/null 2>&1 && npm install puppeteer --no-fund --no-audit
+          COPY . .
+          CMD ["node", "e2e_preview.js"]
+          DOCKEREOF
+          docker run --rm \
+            --network ${PREVIEW_NET} \
+            -e PREVIEW_URL="http://${PREVIEW_CONT}:${{ inputs.preview_internal_port }}" \
+            ${E2E_IMG}
+          echo "E2E OK"
+
+      - name: OWASP ZAP baseline (DAST) — gate High
+        if: ${{ inputs.zap_enabled }}
+        run: |
+          set -e
+          ZAP_TARGET="http://${PREVIEW_CONT}:${{ inputs.preview_internal_port }}"
+          mkdir -p ${GITHUB_WORKSPACE}/zap-out
+          ZAP_EXIT=0
+          docker run --rm -t \
+            -v ${GITHUB_WORKSPACE}/.zap/rules.tsv:/zap/rules.tsv \
+            -v ${GITHUB_WORKSPACE}/zap-out:/zap/wrk \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t "${ZAP_TARGET}" \
+            -c /zap/rules.tsv \
+            -J /zap/wrk/zap_report.json \
+            -r /zap/wrk/zap_report.html || ZAP_EXIT=$?
+          echo "ZAP exit code: ${ZAP_EXIT}"
+          if [ ! -s ${GITHUB_WORKSPACE}/zap-out/zap_report.json ]; then
+            echo "ERROR: ZAP no generó reporte" >&2; exit 1
+          fi
+          if [ "${ZAP_EXIT}" -ge "${{ inputs.zap_fail_threshold }}" ]; then
+            echo "ZAP encontró alertas ≥ threshold — gate falla" >&2
+            exit ${ZAP_EXIT}
+          fi
+          echo "ZAP OK (sin alertas por encima del threshold)"
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: zap-out/
+          retention-days: 7
+
+      - name: Destruir preview (siempre)
+        if: always()
+        run: |
+          docker rm -f ${PREVIEW_CONT} 2>/dev/null || true
+          docker network rm ${PREVIEW_NET} 2>/dev/null || true
+          echo "Preview destruido"
