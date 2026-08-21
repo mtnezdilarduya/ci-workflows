@@ -1,17 +1,21 @@
-name: Smoke4 (reusable)
+name: Smoke5 (reusable)
 on:
   workflow_call:
     inputs:
       image_name:
         required: true
         type: string
-      runner_label:
+    secrets:
+      DOCKERHUB_USERNAME:
         required: false
-        default: homelab-preview
-        type: string
 
 jobs:
-  smoke:
-    runs-on: ${{ inputs.runner_label }}
+  job1:
+    runs-on: ubuntu-latest
     steps:
-      - run: echo "SMOKE OK — imagen ${{ inputs.image_name }} en ${{ inputs.runner_label }}"
+      - run: echo "JOB1 — ${{ inputs.image_name }}"
+  job2:
+    runs-on: ubuntu-latest
+    needs: job1
+    steps:
+      - run: echo "JOB2 — después de job1"
