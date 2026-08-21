@@ -1,0 +1,16 @@
+name: Smoke (reusable)
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        required: true
+        type: string
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "SMOKE OK — imagen ${{ inputs.image_name }}"
