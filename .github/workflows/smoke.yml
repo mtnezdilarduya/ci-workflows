@@ -1,4 +1,4 @@
-name: Smoke2 (reusable)
+name: Smoke3 (reusable)
 on:
   workflow_call:
     inputs:
@@ -12,6 +12,10 @@ on:
     secrets:
       DOCKERHUB_USERNAME:
         required: false
+
+concurrency:
+  group: ci-reusable-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   smoke:
