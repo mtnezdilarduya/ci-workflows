@@ -113,8 +113,6 @@ jobs:
   trivy-fs:
     name: Trivy (deps)
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Checkout (workspace del job)
         run: |
@@ -165,9 +163,6 @@ jobs:
     name: Semgrep (SAST)
     runs-on: ubuntu-latest
     needs: trivy-fs
-    permissions:
-      contents: read
-      security-events: write
     steps:
       - name: Checkout (workspace del job)
         run: |
@@ -198,8 +193,6 @@ jobs:
     name: Docker build + push + Scout
     runs-on: ubuntu-latest
     needs: [trivy-fs, semgrep]
-    permissions:
-      contents: read
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -296,8 +289,6 @@ jobs:
     needs: [docker-build, trivy-image]
     # Guard de seguridad (H5): solo main — un PR de fork jamás toca el homelab.
     if: github.ref == 'refs/heads/main'
-    permissions:
-      contents: read
     steps:
       - name: Checkout (workspace del job)
         run: |
