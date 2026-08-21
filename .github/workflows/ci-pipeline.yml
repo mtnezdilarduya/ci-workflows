@@ -113,13 +113,17 @@ jobs:
   trivy-fs:
     name: Trivy (deps)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout (git CLI con gh auth)
         run: |
           # El runner tiene gh preinstalado y autenticado con el token del job.
           # gh auth setup-git configura git para usar el token — así el clone
           # del repo del caller (público o privado) funciona sin credenciales.
-          gh auth setup-git 2>/dev/null || true
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
             "https://github.com/${GITHUB_REPOSITORY}.git" repo
           cd repo
@@ -169,10 +173,15 @@ jobs:
     name: Semgrep (SAST)
     runs-on: ubuntu-latest
     needs: trivy-fs
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout (git CLI con gh auth)
         run: |
-          gh auth setup-git 2>/dev/null || true
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
             "https://github.com/${GITHUB_REPOSITORY}.git" repo
           cd repo
@@ -202,13 +211,16 @@ jobs:
     name: Docker build + push + Scout
     runs-on: ubuntu-latest
     needs: [trivy-fs, semgrep]
+    permissions:
+      contents: read
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout (git CLI con gh auth)
         run: |
-          gh auth setup-git 2>/dev/null || true
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
             "https://github.com/${GITHUB_REPOSITORY}.git" repo
           cd repo
@@ -301,10 +313,14 @@ jobs:
     needs: [docker-build, trivy-image]
     # Guard de seguridad (H5): solo main — un PR de fork jamás toca el homelab.
     if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout (git CLI con gh auth)
         run: |
-          gh auth setup-git 2>/dev/null || true
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
             "https://github.com/${GITHUB_REPOSITORY}.git" repo
           cd repo
