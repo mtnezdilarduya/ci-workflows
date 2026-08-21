@@ -1,4 +1,4 @@
-name: Smoke8 (reusable)
+name: Smoke9 (reusable)
 on:
   workflow_call:
     inputs:
@@ -14,14 +14,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Trivy CLI
+        run: |
+          curl -fsSL -o /tmp/trivy.deb \
+            https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.deb
+          sudo dpkg -i /tmp/trivy.deb
       - name: Scan deps
-        uses: aquasecurity/trivy-action@0.36.0
-        with:
-          scan-type: "fs"
-          scan-ref: "."
-          severity: "CRITICAL"
-          exit-code: "1"
-          ignore-unfixed: "true"
+        run: trivy fs --severity CRITICAL --ignore-unfixed --vuln-type library --exit-code 1 .
   job2:
     runs-on: ubuntu-latest
     needs: trivy-fs
