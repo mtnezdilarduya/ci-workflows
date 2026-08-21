@@ -1,4 +1,4 @@
-name: Smoke6 (reusable)
+name: Smoke7 (reusable)
 on:
   workflow_call:
     inputs:
@@ -27,4 +27,4 @@ jobs:
     runs-on: ubuntu-latest
     needs: trivy-fs
     steps:
-      - run: echo "JOB2 — después de trivy-fs — ${{ inputs.image_name }}"
+      - run: echo "JOB2 OK — ${{ inputs.image_name }}"
