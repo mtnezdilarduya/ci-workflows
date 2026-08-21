@@ -1,26 +1,17 @@
-name: Smoke3 (reusable)
+name: Smoke4 (reusable)
 on:
   workflow_call:
     inputs:
       image_name:
         required: true
         type: string
-      zap_enabled:
+      runner_label:
         required: false
-        default: true
-        type: boolean
-    secrets:
-      DOCKERHUB_USERNAME:
-        required: false
-
-concurrency:
-  group: ci-reusable-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: true
+        default: homelab-preview
+        type: string
 
 jobs:
   smoke:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner_label }}
     steps:
-      - run: echo "SMOKE OK — imagen ${{ inputs.image_name }}"
-      - if: ${{ inputs.zap_enabled }}
-        run: echo "ZAP enabled"
+      - run: echo "SMOKE OK — imagen ${{ inputs.image_name }} en ${{ inputs.runner_label }}"
